@@ -21,6 +21,8 @@ use std::{
 };
 
 use async_recursion::async_recursion;
+use async_walkdir::{Filtering, WalkDir};
+use chrono::{DateTime, Datelike, TimeZone, Timelike, Utc};
 
 #[inline(always)]
 pub fn get_file_meta(path: impl AsRef<Path>) -> Result<Metadata, std::io::Error> {
@@ -74,6 +76,75 @@ pub fn put_file_contents(file: &str, contents: &[u8]) -> Result<(), std::io::Err
     std::fs::rename(temp_file, file)?;
 
     Ok(())
+}
+
+pub fn ts_scan_files(
+    pattern: String,
+    ext: String,
+    walker_time_range: Option<(DateTime<Utc>, DateTime<Utc>)>,
+) -> WalkDir {
+    WalkDir::new(&pattern).filter(move |p| {
+        let fext = ext.clone();
+        let pat = pattern.clone();
+        async move {
+            let path = p.path();
+
+            if path.is_file()
+                && path
+                    .extension()
+                    .and_then(|os| os.to_str())
+                    .is_some_and(|ext| ext == fext)
+            {
+                Filtering::Continue
+            } else if path.is_dir() {
+                if let Some((s, e)) = &walker_time_range {
+                    let start_year = s.year();
+                    let end_year = e.year();
+
+                    let start_month = s.month();
+                    let end_month = e.month();
+
+                    let start_day = s.day();
+                    let end_day = e.day();
+
+                    let start_hour = s.hour();
+                    let end_hour = e.hour();
+
+                    if let Ok(remaining) = path.strip_prefix(&pat) {
+                        if remaining
+                            .components()
+                            .skip(1)
+                            .filter_map(|c| c.as_os_str().to_str())
+                            .filter_map(|s| s.parse::<i32>().ok())
+                            .zip(
+                                [
+                                    (start_year, end_year),
+                                    (start_month as i32, end_month as i32),
+                                    (start_day as i32, end_day as i32),
+                                    (start_hour as i32, end_hour as i32),
+                                ]
+                                .into_iter(),
+                            )
+                            .all(|(key, (start, end))| key >= start && key <= end)
+                        {
+                            Filtering::Continue
+                        } else {
+                            Filtering::IgnoreDir
+                        }
+                    } else {
+                        // If stripping prefix fails - we casually discontinue search
+                        Filtering::IgnoreDir
+                    }
+                } else {
+                    // If there is no timerange, we continue scanning all paths
+                    Filtering::Continue
+                }
+            } else {
+                // We'll ignore non-file, non-directory case
+                Filtering::Ignore
+            }
+        }
+    })
 }
 
 #[inline(always)]
@@ -173,6 +244,10 @@ pub fn set_permission<P: AsRef<std::path::Path>>(
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
+    use futures::StreamExt;
+
     use super::*;
 
     #[test]
@@ -213,5 +288,87 @@ mod tests {
         assert!(get_file_contents(file_name, Some(0..100)).is_err());
 
         std::fs::remove_file(file_name).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_ts_scan_files() {
+        for day in 30..=31 {
+            for hour in 20..24 {
+                std::fs::create_dir_all(format!("./test_path/2025/12/{day}/{hour}")).unwrap();
+                std::fs::create_dir_all(format!("./test_path/2025/12/{day}/{hour}/ignored"))
+                    .unwrap();
+                for file in 1..5 {
+                    std::fs::File::create(format!(
+                        "./test_path/2025/12/{day}/{hour}/{file}.parquet"
+                    )).unwrap();
+                    std::fs::File::create(format!(
+                        "./test_path/2025/12/{day}/{hour}/{file}.json"
+                    ))
+                    .unwrap();
+                }
+            }
+        }
+
+        let mut walker = ts_scan_files(
+            "./test_path".to_string(),
+            ".parquet".to_string(),
+            chrono::NaiveDateTime::parse_from_str(
+                "2025 Dec 31 22:00:00.000 +0000",
+                "%Y %b %d %H:%M:%S%.3f %z",
+            )
+            .ok()
+            .zip(
+                chrono::NaiveDateTime::parse_from_str(
+                    "2025 Dec 31 23:00:00.000 +0000",
+                    "%Y %b %d %H:%M:%S%.3f %z",
+                )
+                .ok(),
+            )
+            .map(|(n1, n2)| (n1.and_utc(), n2.and_utc())),
+        );
+
+        assert_eq!(
+            walker.next().await.unwrap().ok().map(|x| x.path()), 
+            PathBuf::from("./test_path/2025/12/31/23/4")
+                .canonicalize()
+                .ok());
+        assert_eq!(
+            walker.next().await.unwrap().ok().map(|x| x.path()), 
+            PathBuf::from("./test_path/2025/12/31/23/3")
+                .canonicalize()
+                .ok());
+        assert_eq!(
+            walker.next().await.unwrap().ok().map(|x| x.path()), 
+            PathBuf::from("./test_path/2025/12/31/23/2")
+                .canonicalize()
+                .ok());
+        assert_eq!(
+            walker.next().await.unwrap().ok().map(|x| x.path()), 
+            PathBuf::from("./test_path/2025/12/31/23/1")
+                .canonicalize()
+                .ok());
+
+        assert_eq!(
+            walker.next().await.unwrap().ok().map(|x| x.path()), 
+            PathBuf::from("./test_path/2025/12/31/22/4")
+                .canonicalize()
+                .ok());
+        assert_eq!(
+            walker.next().await.unwrap().ok().map(|x| x.path()), 
+            PathBuf::from("./test_path/2025/12/31/22/3")
+                .canonicalize()
+                .ok());
+        assert_eq!(
+            walker.next().await.unwrap().ok().map(|x| x.path()), 
+            PathBuf::from("./test_path/2025/12/31/22/2")
+                .canonicalize()
+                .ok());
+        assert_eq!(
+            walker.next().await.unwrap().ok().map(|x| x.path()), 
+            PathBuf::from("./test_path/2025/12/31/22/1")
+                .canonicalize()
+                .ok());
+
+        std::fs::remove_dir_all("./test_path").unwrap();
     }
 }

@@ -13,10 +13,15 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-use std::{path::Path, sync::Arc};
+use std::{
+    path::Path,
+    sync::Arc,
+};
 
 use arrow::array::{ArrayRef, new_null_array};
 use arrow_schema::{DataType, Field};
+use async_walkdir::{Filtering, WalkDir};
+use chrono::{DateTime, Datelike, Timelike};
 use config::{
     cluster::LOCAL_NODE,
     get_config,
@@ -25,7 +30,7 @@ use config::{
         stream::{FileKey, StreamParams, StreamPartition},
     },
     utils::{
-        file::{is_exists, scan_files},
+        file::{is_exists, ts_scan_files},
         parquet::{parse_time_range_from_filename, read_metadata_from_file},
         record_batch_ext::concat_batches,
         size::bytes_to_human_readable,
@@ -578,9 +583,14 @@ async fn get_file_list_inner(
         "{}/files/{}/{}/{}/",
         wal_dir, query.org_id, query.stream_type, query.stream_name
     );
-    let files = scan_files(&pattern, file_ext, None).unwrap_or_default();
-    let files = files
-        .iter()
+
+    let extension = file_ext.to_string();
+    let walker_time_range = time_range.clone().and_then(|(s, e)| {
+        DateTime::from_timestamp_micros(s).zip(DateTime::from_timestamp_micros(e))
+    });
+
+    let files = ts_scan_files(pattern, extension, walker_time_range)
+        .filter_map(|e| async { e.ok().and_then(|de| de.path().to_str().map(String::from)) })
         .map(|f| {
             f.strip_prefix(&wal_dir)
                 .unwrap()
@@ -589,7 +599,8 @@ async fn get_file_list_inner(
                 .trim_start_matches('/')
                 .to_string()
         })
-        .collect::<Vec<_>>();
+        .collect::<Vec<String>>()
+        .await;
 
     if files.is_empty() {
         return Ok(vec![]);
